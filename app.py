@@ -1,4 +1,6 @@
+import math
 from flask import Flask, request, jsonify, g
+from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -9,19 +11,24 @@ import os
 import json
 import re
 import pandas as pd
+from flask_cors import CORS
+
 
 # Flask application setup
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- Configuration ---
 app.config['SECRET_KEY'] = 'your-super-secret-key-CHANGE-THIS-IN-PRODUCTION'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:postgres@localhost:5432/scholarship_db'
+# app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:postgres@localhost:5432/scholarship_db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///data.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = 'your-jwt-secret-string-CHANGE-THIS-IN-PRODUCTION'
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 
 # Initialize extensions
 db = SQLAlchemy(app)
+migrate=Migrate(app, db)
 jwt = JWTManager(app)
 
 # --- Standardization Helper Functions (IDENTICAL to generate_new_scholarships.py) ---
@@ -190,9 +197,9 @@ class UserProfile(db.Model):
 
 # --- ML Model and Scholarship JSON Data Loading ---
 
-ML_MODEL_PICKLE = "new_try2.pkl"
+ML_MODEL_PICKLE = "recommendation_pi.pkl"
 # IMPORTANT: This now points to your newly generated 500 standardized JSON file
-CLEANED_DATA_JSON = "data.json" 
+CLEANED_DATA_JSON = "standardized_scholarships.json" 
 
 model_pipeline = None
 try:
@@ -399,71 +406,92 @@ def profile():
             db.session.rollback()
             return jsonify({'error': f'Profile update failed: {str(e)}'}), 500
 
+
+
+def load_scholarships_from_json(file_path='standardized_scholarships.json'):
+    """Loads scholarship data from a JSON file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            scholarships_data = json.load(f)
+            # Assign a unique ID to each scholarship if not already present
+            # We'll use a 1-based index for simplicity, consistent with typical DB IDs
+            for i, s in enumerate(scholarships_data):
+                if 'id' not in s:
+                    s['id'] = i + 1
+            return scholarships_data
+    except FileNotFoundError:
+        print(f"Error: JSON file not found at {file_path}")
+        return []
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from {file_path}")
+        return []
+
+# Load scholarships once when the application starts
+# This acts as your in-memory 'database'
+all_scholarships = load_scholarships_from_json()
+
+# --- Utility function to_dict for individual scholarship (simulating model output) ---
+# Assuming your JSON entries are already dict-like, so this is just a passthrough for now.
+# If your JSON structure is different and needs transformation, this is where to do it.
+def scholarship_to_dict(scholarship_json_entry):
+    """Converts a single scholarship JSON entry to a dictionary suitable for API response."""
+    # Your JSON data already looks like a dictionary, so this might be a direct return.
+    # If you need to rename keys or add/remove fields for the API, do it here.
+    return scholarship_json_entry
+
+
 @app.route('/api/scholarships', methods=['GET'])
 def get_scholarships():
-    level = request.args.get('level')
+    level_of_study = request.args.get('level')
     country = request.args.get('country')
     page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 20))
-    
-    query = Scholarship.query
-    
-    if level:
-        query = query.filter(Scholarship.level.ilike(f'%{level}%'))
+
+    # Start with all scholarships loaded from JSON
+    filtered_scholarships = all_scholarships
+
+    # Apply filters based on query parameters
+    if level_of_study:
+        # Case-insensitive filtering for level_of_study
+        # Use 'level_of_study' key from your JSON data
+        filtered_scholarships = [
+            s for s in filtered_scholarships
+            if s.get('level_of_study') and level_of_study.lower() in s['level_of_study'].lower()
+        ]
     if country:
-        query = query.filter(Scholarship.country.ilike(f'%{country}%'))
-    
-    scholarships = query.paginate(
-        page=page, per_page=per_page, error_out=False
-    )
-    
+        # Case-insensitive filtering for destination_country
+        # Use 'destination_country' key from your JSON data
+        filtered_scholarships = [
+            s for s in filtered_scholarships
+            if s.get('destination_country') and country.lower() in s['destination_country'].lower()
+        ]
+
+    total_items = len(filtered_scholarships)
+    total_pages = math.ceil(total_items / per_page)
+
+    # Implement manual pagination
+    start_index = (page - 1) * per_page
+    end_index = start_index + per_page
+    paginated_items = filtered_scholarships[start_index:end_index]
+
     return jsonify({
-        'scholarships': [s.to_dict() for s in scholarships.items],
-        'total': scholarships.total,
-        'pages': scholarships.pages,
+        'scholarships': [scholarship_to_dict(s) for s in paginated_items],
+        'total': total_items,
+        'pages': total_pages,
         'current_page': page
     })
 
 @app.route('/api/scholarships/<int:scholarship_id>', methods=['GET'])
 def get_scholarship(scholarship_id):
-    scholarship = Scholarship.query.get_or_404(scholarship_id)
-    return jsonify(scholarship.to_dict())
+    # Find the scholarship by ID in the loaded JSON data
+    # We assigned 'id' when loading, so we can use it here
+    scholarship = next((s for s in all_scholarships if s.get('id') == scholarship_id), None)
 
-@app.route('/api/debug/scholarship-fields', methods=['GET'])
-def debug_scholarship_fields():
-    scholarships_list_from_json = get_scholarships_from_json()
-
-    try:
-        if not scholarships_list_from_json:
-            return jsonify({"error": "No scholarships loaded from JSON"}), 500
-        
-        sample_fields = []
-        for i, scholarship in enumerate(scholarships_list_from_json[:5]):
-            sample_fields.append({
-                "index": i,
-                "name": scholarship.get('name', f'Scholarship {i+1}'),
-                "fields": list(scholarship.keys())
-            })
-        
-        all_fields = set()
-        for scholarship in scholarships_list_from_json:
-            all_fields.update(scholarship.keys())
-        
-        return jsonify({
-            "total_scholarships_in_json": len(scholarships_list_from_json),
-            "sample_json_scholarships": sample_fields,
-            "all_unique_json_fields": sorted(list(all_fields)),
-            "expected_fields_for_ml_model_mapping_from_json": [
-                'scholarship_institution', 'scholarship coverage', 'eligible regions / nationalities', 'category',
-                'destination_country', 'level_of_study', 'eligible_degrees', 'name'
-            ]
-        })
-        
-    except Exception as e:
-        import traceback
-        print(f"❌ Error in debug_scholarship_fields: {traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
-
+    if scholarship is None:
+        # Simulate Flask's abort(404) for consistency
+        return jsonify({"error": "Scholarship not found."}), 404
+    
+    return jsonify(scholarship_to_dict(scholarship))
 @app.route('/api/admin/scholarships', methods=['POST'])
 def add_scholarship():
     data = request.get_json()
@@ -549,9 +577,56 @@ def add_scholarship():
         print(f"❌ Error adding scholarship: {traceback.format_exc()}")
         return jsonify({'error': 'Failed to add scholarship', 'details': str(e)}), 500
 
-# --- ML Recommendation Route (without JWT) ---
+def map_string_to_numeric(field, value):
+    mappings = {
+        'sop_quality': {
+            'poor': 2.0,
+            'average': 5.0,
+            'good': 7.0,
+            'excellent': 9.0
+        },
+        'research_experience': {
+            'limited': 0.5,
+            'moderate': 1.0,
+            'extensive': 2.0
+        },
+        'need': {
+            'low': 0.0,
+            'medium': 0.5,
+            'high': 1.0
+        }
+    }
+
+    if value is None:
+        return 0.0
+
+    if isinstance(value, (float, int)):
+        return float(value)
+
+    value_cleaned = value.strip().lower()
+    mapped = mappings.get(field, {}).get(value_cleaned)
+
+    if mapped is None:
+        print(f"⚠️ Warning: Unrecognized value '{value}' for '{field}'. Defaulting to 0.0")
+        return 0.0
+
+    return mapped
+
+
+def parse_user_input(user_input_from_request):
+    return {
+        'gpa': float(user_input_from_request.get('gpa')),
+        'ielts_score': float(user_input_from_request.get('ielts_score')),
+        'sop_quality': map_string_to_numeric('sop_quality', user_input_from_request.get('sop_quality')),
+        'research_experience': map_string_to_numeric('research_experience', user_input_from_request.get('research_experience')),
+        'extracurricular_score': float(user_input_from_request.get('extracurricular_score')),
+        'need': map_string_to_numeric('need', user_input_from_request.get('need')),
+
+        'country': process_country_name(user_input_from_request.get('preferred_country')),
+        'eligible_degrees': process_eligible_degrees(user_input_from_request.get('field_of_study')),
+        'level_of_study': process_level_of_study(user_input_from_request.get('preferred_level')),
+    }
 @app.route('/api/recommendations', methods=['POST'])
-# @jwt_required() # TEMPORARILY COMMENTED OUT FOR DEVELOPMENT
 def recommend_scholarships_ml():
     user_input_from_request = request.get_json()
 
@@ -564,96 +639,78 @@ def recommend_scholarships_ml():
     ]
     for field in required_user_fields:
         if field not in user_input_from_request or user_input_from_request[field] is None:
-            return jsonify({"error": f"Missing or null required user profile field: '{field}' for ML recommendation."}), 400
+            return jsonify({"error": f"Missing or null required user profile field: '{field}'"}), 400
 
-    # --- Standardize user input before passing to ML model ---
-    # Apply standardization functions to ensure consistency with training data
+    # --- Standardized Mappings ---
+    sop_map = {'Poor': 1.0, 'Average': 2.0, 'Good': 3.0, 'Excellent': 4.0}
+    research_map = {'Limited': 1.0, 'Moderate': 2.0, 'Extensive': 3.0}
+    need_map = {'Low': 1.0, 'Medium': 2.0, 'High': 3.0}
+
+    # --- Convert Inputs ---
     user_input_for_ml = {
-        'gpa': float(user_input_from_request.get('gpa')), # Ensure float
-        'ielts_score': float(user_input_from_request.get('ielts_score')), # Ensure float
-        'sop_quality': standardize_string(user_input_from_request.get('sop_quality')), # Standardize
-        'research_experience': float(user_input_from_request.get('research_experience')), # Ensure float
-        'extracurricular_score': float(user_input_from_request.get('extracurricular_score')), # Ensure float
-        'need': float(user_input_from_request.get('need')), # Ensure float
-        
-        # Maps user's profile fields to the MODEL_FEATURES names
-        'country': process_country_name(user_input_from_request.get('preferred_country')), # User's 'preferred_country' maps to 'country' for ML
-        'eligible_degrees': process_eligible_degrees(user_input_from_request.get('field_of_study')), # User's 'field_of_study' maps to 'eligible_degrees' for ML
-        'level_of_study': process_level_of_study(user_input_from_request.get('preferred_level')), # User's 'preferred_level' maps to 'level_of_study' for ML
+        'gpa': float(user_input_from_request.get('gpa')),
+        'ielts_score': float(user_input_from_request.get('ielts_score')),
+        'sop_quality': sop_map.get(user_input_from_request.get('sop_quality'), 2.0),
+        'research_experience': research_map.get(user_input_from_request.get('research_experience'), 2.0),
+        'extracurricular_score': float(user_input_from_request.get('extracurricular_score')),
+        'need': need_map.get(user_input_from_request.get('need'), 2.0),
+        'country': process_country_name(user_input_from_request.get('preferred_country')),
+        'eligible_degrees': process_eligible_degrees(user_input_from_request.get('field_of_study')),
+        'level_of_study': process_level_of_study(user_input_from_request.get('preferred_level')),
     }
 
     if model_pipeline is None:
-        print("ML model not loaded. Using fallback recommendation logic.")
-        all_scholarships_db = Scholarship.query.all()
-        fallback_recs = get_recommendations_fallback(user_input_for_ml, all_scholarships_db)
-        return jsonify({
-            "message": "ML model unavailable. Fallback recommendations provided.",
-            "recommendations": [
-                {"name": r['scholarship']['name'], "match_probability": r['score'], "id": r['scholarship']['id']}
-                for r in fallback_recs
-            ]
-        })
+        return jsonify({"message": "ML model unavailable", "recommendations": []})
 
     recommendations = []
-    all_scholarships_json = get_scholarships_from_json() 
+    all_scholarships_json = get_scholarships_from_json()
 
     for s_idx, s_json in enumerate(all_scholarships_json):
         try:
-            combined_features_dict = {}
+            # Extract scholarship values
+            scholarship_country = process_country_name(s_json.get('destination_country'))
+            scholarship_level = process_level_of_study(s_json.get('level_of_study'))
 
-            # Add user input (already standardized)
-            for feature in ['gpa', 'ielts_score', 'sop_quality', 'research_experience', 'extracurricular_score', 'need',
-                            'country', 'eligible_degrees', 'level_of_study']: # Use MODEL_FEATURES names for user data
-                combined_features_dict[feature] = user_input_for_ml.get(feature)
+            # --- Apply user filters only if provided ---
+            if user_input_for_ml['country'] and scholarship_country:
+                if user_input_for_ml['country'] != scholarship_country:
+                    continue
 
-            # Add scholarship attributes from JSON data - APPLY STANDARDIZATION HERE
-            # Note: JSON keys like 'scholarship coverage' are still used for .get(), then processed
-            combined_features_dict['scholarship_institution'] = standardize_string(s_json.get('scholarship_institution'))
-            combined_features_dict['scholarship_coverage'] = process_scholarship_coverage(s_json.get('scholarship coverage'))
-            combined_features_dict['eligible regions / nationalities'] = standardize_string(s_json.get('eligible regions / nationalities'))
-            combined_features_dict['category'] = standardize_string(s_json.get('category'))
+            if user_input_for_ml['level_of_study'] and scholarship_level:
+                if user_input_for_ml['level_of_study'] != scholarship_level:
+                    continue
 
-            # Handle scholarship's own country/degrees/level from JSON
-            # Overwrite user input if user's value was None, otherwise use user's preference
-            if combined_features_dict['country'] is None:
-                combined_features_dict['country'] = process_country_name(s_json.get('destination_country'))
-            if combined_features_dict['eligible_degrees'] is None:
+            # --- Build features dict for prediction ---
+            combined_features_dict = {
+                **user_input_for_ml,  # includes gpa, sop, etc.
+                'scholarship_institution': standardize_string(s_json.get('scholarship_institution')),
+                'scholarship_coverage': process_scholarship_coverage(s_json.get('scholarship coverage')),
+                'eligible regions / nationalities': standardize_string(s_json.get('eligible regions / nationalities')),
+                'category': standardize_string(s_json.get('category')),
+            }
+
+            # Ensure fallback if null
+            if not combined_features_dict['country']:
+                combined_features_dict['country'] = scholarship_country
+            if not combined_features_dict['eligible_degrees']:
                 combined_features_dict['eligible_degrees'] = process_eligible_degrees(s_json.get('eligible_degrees'))
-            if combined_features_dict['level_of_study'] is None:
-                combined_features_dict['level_of_study'] = process_level_of_study(s_json.get('level_of_study'))
-            
-            # Create DataFrame for Prediction, ensuring MODEL_FEATURES order
+            if not combined_features_dict['level_of_study']:
+                combined_features_dict['level_of_study'] = scholarship_level
+
+            # Create DataFrame for model
             input_df = pd.DataFrame([combined_features_dict], columns=MODEL_FEATURES)
-
-            # --- DEBUG PRINTS START (Uncomment if you need to inspect input/transformed data) ---
-            # current_scholarship_name = s_json.get('name', f"Scholarship {s_idx + 1}")
-            # print(f"\n--- Processing: {current_scholarship_name} (Index: {s_idx}) ---")
-            # print(f"Input DataFrame to pipeline:\n{input_df}")
-
-            # preprocessor = model_pipeline.named_steps['preprocessor']
-            # transformed_data = preprocessor.transform(input_df)
-            # if hasattr(transformed_data, 'toarray'): transformed_data = transformed_data.toarray()
-            # print(f"Transformed data (input to classifier):\n{transformed_data}")
-            # --- DEBUG PRINTS END ---
-
-            prob = model_pipeline.predict_proba(input_df)[0][1] 
+            prob = model_pipeline.predict_proba(input_df)[0][1]
             match_score = round(prob * 100, 2)
 
-            # --- DEBUG PRINT FOR SCORE (Uncomment to see all scores) ---
-            # print(f"Calculated match_score for {current_scholarship_name}: {match_score}%")
-            # --- END DEBUG PRINT FOR SCORE ---
-
-            if match_score >= 10.0: # Filter out very low matches (adjust threshold as needed)
+            if match_score >= 10.0:
                 recommendations.append({
                     "name": s_json.get('name', f"Scholarship {s_idx + 1}"),
                     "match_probability": match_score,
-                    "id": s_idx + 1 # Using loop index for ID
+                    "id": s_idx + 1
                 })
 
         except Exception as e:
-            print(f"❌ Error processing scholarship {s_json.get('name', s_json.get('id', 'N/A'))}: {e}")
-            import traceback
-            print(f"Full traceback for error: {traceback.format_exc()}")
+            print(f"Error on scholarship {s_idx}: {e}")
             continue
 
     recommendations.sort(key=lambda x: x['match_probability'], reverse=True)
@@ -664,107 +721,122 @@ def recommend_scholarships_ml():
         "recommendations": top_recommendations
     })
 
+# --- ML Recommendation Route (without JWT) ---
+# @app.route('/api/recommendations', methods=['POST'])
+# # @jwt_required() # TEMPORARILY COMMENTED OUT FOR DEVELOPMENT
+# def recommend_scholarships_ml():
+#     user_input_from_request = request.get_json()
 
-# # --- Database Initialization (Development Mode: Drops and Recreates Tables) ---
-# def create_tables_and_populate_samples():
-#     print("\n--- Running create_tables_and_populate_samples() ---")
-    
-#     try:
-#         print("Attempting to drop all existing database tables...")
-#         db.drop_all()
-#         print("✅ Successfully dropped all tables.")
+#     if not user_input_from_request:
+#         return jsonify({"error": "No user input provided in JSON format."}), 400
+
+#     required_user_fields = [
+#         'gpa', 'ielts_score', 'preferred_level', 'preferred_country', 'field_of_study',
+#         'sop_quality', 'research_experience', 'extracurricular_score', 'need'
+#     ]
+#     for field in required_user_fields:
+#         if field not in user_input_from_request or user_input_from_request[field] is None:
+#             return jsonify({"error": f"Missing or null required user profile field: '{field}' for ML recommendation."}), 400
+
+#     # --- Standardize user input before passing to ML model ---
+#     # Apply standardization functions to ensure consistency with training data
+#     user_input_for_ml = {
+#         'gpa': float(user_input_from_request.get('gpa')), # Ensure float
+#         'ielts_score': float(user_input_from_request.get('ielts_score')), # Ensure float
+#         'sop_quality': standardize_string(user_input_from_request.get('sop_quality')), # Standardize
+#         'research_experience': float(user_input_from_request.get('research_experience')), # Ensure float
+#         'extracurricular_score': float(user_input_from_request.get('extracurricular_score')), # Ensure float
+#         'need': float(user_input_from_request.get('need')), # Ensure float
         
-#         print("Attempting to create all database tables based on models...")
-#         db.create_all()
-#         print("✅ Successfully created all tables.")
-        
-#         print("Adding sample scholarships to database from JSON...")
-#         all_json_scholarships = get_scholarships_from_json() 
-        
-#         if not all_json_scholarships:
-#             print("No scholarships loaded from JSON file. Skipping sample data population.")
-#             return
+#         # Maps user's profile fields to the MODEL_FEATURES names
+#         'country': process_country_name(user_input_from_request.get('preferred_country')), # User's 'preferred_country' maps to 'country' for ML
+#         'eligible_degrees': process_eligible_degrees(user_input_from_request.get('field_of_study')), # User's 'field_of_study' maps to 'eligible_degrees' for ML
+#         'level_of_study': process_level_of_study(user_input_from_request.get('preferred_level')), # User's 'preferred_level' maps to 'level_of_study' for ML
+#     }
 
-#         scholarships_to_add = []
-#         for scholarship_data in all_json_scholarships:
-#             # --- Apply Standardization here for DB population (identical to how it's applied for ML input) ---
-#             name = scholarship_data.get('name')
+#     if model_pipeline is None:
+#         print("ML model not loaded. Using fallback recommendation logic.")
+#         all_scholarships_db = Scholarship.query.all()
+#         fallback_recs = get_recommendations_fallback(user_input_for_ml, all_scholarships_db)
+#         return jsonify({
+#             "message": "ML model unavailable. Fallback recommendations provided.",
+#             "recommendations": [
+#                 {"name": r['scholarship']['name'], "match_probability": r['score'], "id": r['scholarship']['id']}
+#                 for r in fallback_recs
+#             ]
+#         })
 
-#             description_parts = []
-#             if scholarship_data.get('country'): description_parts.append(f"Origin Country: {scholarship_data['country']}")
-#             if scholarship_data.get('scholarship_institution'): description_parts.append(f"Institution: {scholarship_data['scholarship_institution']}")
-#             if scholarship_data.get('level_of_study'): description_parts.append(f"Level: {scholarship_data['level_of_study']}")
-#             if scholarship_data.get('eligible_degrees'): description_parts.append(f"Degrees: {scholarship_data['eligible_degrees']}")
-#             if scholarship_data.get('category'): description_parts.append(f"Category: {data['category']}")
-#             description = " | ".join(description_parts) if description_parts else None
+#     recommendations = []
+#     all_scholarships_json = get_scholarships_from_json() 
 
-#             level_processed = process_level_of_study(scholarship_data.get('level_of_study'))
-#             country_db = process_country_name(scholarship_data.get('destination_country'))
-
-#             min_gpa_db = None 
-            
-#             min_ielts_db = None
-#             ielts_raw_db = scholarship_data.get('ielts_requirement', '')
-#             match_ielts = re.search(r'(\d+(?:\.\d+)?)', ielts_raw_db)
-#             if match_ielts:
-#                 try: min_ielts_db = float(match_ielts.group(1))
-#                 except ValueError: pass
-
-#             amount_db = process_scholarship_coverage(scholarship_data.get('scholarship coverage'))
-#             requirements_db = process_eligible_degrees(scholarship_data.get('eligible_degrees'))
-
-#             deadline_db = None
-#             deadline_raw_db = scholarship_data.get('application deadline', '').strip()
-#             for fmt_db in ['%Y-%m-%d', '%d-%b-%y', '%d-%b-%Y', '%B %d, %Y', '%b %d, %Y', '%Y-%m-%d %H:%M %p']:
-#                 try:
-#                     if 'PM' in deadline_raw_db or 'AM' in deadline_raw_db or ':' in deadline_raw_db:
-#                         date_part_to_parse = deadline_raw_db.split('(')[0].strip()
-#                         if re.match(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b', date_part_to_parse, re.IGNORECASE):
-#                             parsed_dt_db = datetime.strptime(date_part_to_parse, '%B %d, %Y')
-#                             deadline_db = parsed_dt_db.date()
-#                             break
-#                         else:
-#                             continue 
-#                     else:
-#                         deadline_db = datetime.strptime(deadline_raw_db, fmt_db).date()
-#                         break
-#                 except ValueError: continue
-            
-#             if 'rolling' in deadline_raw_db.lower() or 'varies' in deadline_raw_db.lower():
-#                 deadline_db = date(2099, 12, 31)
-#             elif deadline_raw_db and not deadline_db:
-#                 print(f"Warning: Could not parse deadline '{deadline_raw_db}'. Setting to None.")
-
-#             scholarship_institution_db = standardize_string(scholarship_data.get('scholarship_institution'))
-#             eligible_regions_nationalities_db = standardize_string(scholarship_data.get('eligible regions / nationalities'))
-#             category_db = standardize_string(scholarship_data.get('category'))
-
-#             scholarships_to_add.append(Scholarship(
-#                 name=name,
-#                 description=description,
-#                 level=level_processed,
-#                 country=country_db,
-#                 min_gpa=min_gpa_db,
-#                 min_ielts=min_ielts_db,
-#                 amount=amount_db,
-#                 deadline=deadline_db,
-#                 requirements=requirements_db,
-#                 scholarship_institution=scholarship_institution_db,
-#                 scholarship_coverage=amount_db, # Re-using processed amount for scholarship_coverage in DB
-#                 eligible_regions_nationalities=eligible_regions_nationalities_db,
-#                 category=category_db
-#             ))
-        
+#     for s_idx, s_json in enumerate(all_scholarships_json):
 #         try:
-#             db.session.bulk_save_objects(scholarships_to_add)
-#             db.session.commit()
-#             print(f"✅ Added {len(scholarships_to_add)} sample scholarships to database from JSON.")
+#             combined_features_dict = {}
+
+#             # Add user input (already standardized)
+#             for feature in ['gpa', 'ielts_score', 'sop_quality', 'research_experience', 'extracurricular_score', 'need',
+#                             'country', 'eligible_degrees', 'level_of_study']: # Use MODEL_FEATURES names for user data
+#                 combined_features_dict[feature] = user_input_for_ml.get(feature)
+
+#             # Add scholarship attributes from JSON data - APPLY STANDARDIZATION HERE
+#             # Note: JSON keys like 'scholarship coverage' are still used for .get(), then processed
+#             combined_features_dict['scholarship_institution'] = standardize_string(s_json.get('scholarship_institution'))
+#             combined_features_dict['scholarship_coverage'] = process_scholarship_coverage(s_json.get('scholarship coverage'))
+#             combined_features_dict['eligible regions / nationalities'] = standardize_string(s_json.get('eligible regions / nationalities'))
+#             combined_features_dict['category'] = standardize_string(s_json.get('category'))
+
+#             # Handle scholarship's own country/degrees/level from JSON
+#             # Overwrite user input if user's value was None, otherwise use user's preference
+#             if combined_features_dict['country'] is None:
+#                 combined_features_dict['country'] = process_country_name(s_json.get('destination_country'))
+#             if combined_features_dict['eligible_degrees'] is None:
+#                 combined_features_dict['eligible_degrees'] = process_eligible_degrees(s_json.get('eligible_degrees'))
+#             if combined_features_dict['level_of_study'] is None:
+#                 combined_features_dict['level_of_study'] = process_level_of_study(s_json.get('level_of_study'))
+            
+#             # Create DataFrame for Prediction, ensuring MODEL_FEATURES order
+#             input_df = pd.DataFrame([combined_features_dict], columns=MODEL_FEATURES)
+
+#             # --- DEBUG PRINTS START (Uncomment if you need to inspect input/transformed data) ---
+#             # current_scholarship_name = s_json.get('name', f"Scholarship {s_idx + 1}")
+#             # print(f"\n--- Processing: {current_scholarship_name} (Index: {s_idx}) ---")
+#             # print(f"Input DataFrame to pipeline:\n{input_df}")
+
+#             # preprocessor = model_pipeline.named_steps['preprocessor']
+#             # transformed_data = preprocessor.transform(input_df)
+#             # if hasattr(transformed_data, 'toarray'): transformed_data = transformed_data.toarray()
+#             # print(f"Transformed data (input to classifier):\n{transformed_data}")
+#             # --- DEBUG PRINTS END ---
+
+#             prob = model_pipeline.predict_proba(input_df)[0][1] 
+#             match_score = round(prob * 100, 2)
+
+#             # --- DEBUG PRINT FOR SCORE (Uncomment to see all scores) ---
+#             # print(f"Calculated match_score for {current_scholarship_name}: {match_score}%")
+#             # --- END DEBUG PRINT FOR SCORE ---
+
+#             if match_score >= 10.0: # Filter out very low matches (adjust threshold as needed)
+#                 recommendations.append({
+#                     "name": s_json.get('name', f"Scholarship {s_idx + 1}"),
+#                     "match_probability": match_score,
+#                     "id": s_idx + 1 # Using loop index for ID
+#                 })
+
 #         except Exception as e:
-#             db.session.rollback()
-#             print(f"❌ Error adding sample scholarships from JSON: {e}")
+#             print(f"❌ Error processing scholarship {s_json.get('name', s_json.get('id', 'N/A'))}: {e}")
 #             import traceback
-#             print(f"Full traceback: {traceback.format_exc()}")
-#             raise 
+#             print(f"Full traceback for error: {traceback.format_exc()}")
+#             continue
+
+#     recommendations.sort(key=lambda x: x['match_probability'], reverse=True)
+#     top_recommendations = recommendations[:10]
+
+#     return jsonify({
+#         "message": f"Found {len(top_recommendations)} matching scholarships",
+#         "recommendations": top_recommendations
+#     })
+
+
 
 # Error handlers
 @app.errorhandler(404)
@@ -781,7 +853,7 @@ def internal_error(error):
 
 # --- App Run ---
 if __name__ == '__main__':
-    ML_MODEL_PICKLE = "new_try2.pkl"
+    ML_MODEL_PICKLE = "recommendation_pi.pkl"
     
     model_pipeline = None # Initialize as None
     try:
